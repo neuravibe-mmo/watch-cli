@@ -199,8 +199,13 @@ count and free-credit number stay current without a watch-cli release.
 ## Commands
 
 ```text
-watch <url> [frame-count] [--cookies <file>]
+watch <url> [frame-count] [--cookies <file>] [--no-cache]
   Orchestrator. Downloads, extracts frames, transcribes — one block out.
+  Archives the result; watching the same URL again reuses it.
+
+watch-archive ls | find <query> | get <id|url> | where
+  Query everything you've watched. `find` returns the timestamp of the
+  matching line, so you get a seek position, not a video to re-watch.
 
 dl-video <url> [out-dir] [--cookies <file>]
   Just download the video. Returns the local mp4 path.
@@ -208,8 +213,9 @@ dl-video <url> [out-dir] [--cookies <file>]
 extract-frames <video> [count] [out-dir]
   Pull N evenly-spaced JPG frames. Default 8.
 
-transcribe <audio-or-video> [language]
+transcribe <audio-or-video> [language] [--segments-out <path>]
   Speech-to-text. Auto-extracts audio from video first.
+  --segments-out also writes timestamped segments to a JSON sidecar.
 
 audio-q <audio-or-video> "<question>"
   Audio scene Q&A — tone, music, SFX, language, emotion.
@@ -219,6 +225,22 @@ models [--all]
   List audio models available on Kyma (live, no hardcoded list).
   --all to see every Kyma SKU (text + image + video + audio).
 ```
+
+### Watch once, keep it
+
+Every successful run is archived to `~/.watch-cli/archive`, so the same
+video is never transcribed twice. A second `watch` on the same URL skips
+both the download and the ASR call and prints byte-identical output.
+
+```bash
+watch https://youtu.be/xyz          # first run: downloads, transcribes
+watch https://youtu.be/xyz          # cache hit, no API spend
+watch-archive find "context graph"  # → id, [04:32], the line, across everything
+```
+
+Records are plain JSON, SRT and JPG on disk. `grep` and `jq` read them
+perfectly well without this tool, and `transcript.srt` drops straight into
+any video player. Full layout in [`docs/archive.md`](docs/archive.md).
 
 ### How `transcribe` and `audio-q` stay current
 

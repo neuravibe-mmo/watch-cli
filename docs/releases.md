@@ -43,13 +43,22 @@ v1 stability promise in `output-schema.md` is the authoritative list.
 
 ### Pre-1.0 (current state)
 
-watch-cli is at **v0.2.0** as of the merge of Phase 3. While the major
-is `0`, minor bumps are **allowed to contain breaking changes** —
-standard pre-1.0 semver. This gives the foundation specs
+The current version always lives in `lib/version.sh` — see *Version
+source of truth* below rather than trusting a number written here.
+
+While the major is `0`, minor bumps are **allowed to contain breaking
+changes** — standard pre-1.0 semver. This gives the foundation specs
 (output-schema, exit-codes, offline-mode, releases, homebrew) one
 final shakeout before freeze. `0.X.0` may rename a JSON field, change
 an exit code, or rename a stderr tag if the change improves the
-spec. `0.0.X` continues to mean "bug fix only" even pre-1.0.
+spec.
+
+`0.0.X` means **the output schema does not move**. That covers bug
+fixes, and it also covers additive work — a new sibling binary, a new
+opt-in flag, a cache underneath an existing command — as long as the
+block `watch` prints is unchanged and every existing consumer keeps
+parsing it without edits. The promise a patch makes is about the
+contract, not about the size of the diff.
 
 ### Cutoff to v1.0.0
 

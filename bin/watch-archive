@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# watch-archive <command>
+#
+#   ls [limit]            what's been watched, newest first (default 20)
+#   find <query>          search every transcript; prints id, timestamp, line
+#   get <id|url>          reprint one record
+#   where                 print the archive root
+#
+# Reads the records bin/watch leaves behind (see docs/archive.md). Kept as a
+# separate binary rather than subcommands on `watch`, so `watch`'s argument
+# parsing — which already juggles --pipe, --format and a positional
+# frame-count — stays untouched.
+#
+# Nothing here is required to read the archive: it is plain JSON and SRT on
+# disk, so `grep` and `jq` work just as well. This is a convenience, not a
+# gatekeeper.
+#
+# Exit codes (see docs/exit-codes.md):
+#   0 success · 1 general · 64 usage error
+
+set -uo pipefail
+
+# Resolve symlinks so $ROOT_DIR points at the real install dir, not ~/.local.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ $SELF != /* ]] && SELF="$SELF_DIR/$SELF"
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
+# shellcheck source=../lib/version.sh
+source "$ROOT_DIR/lib/version.sh"
+# shellcheck source=../lib/archive.sh
+source "$ROOT_DIR/lib/archive.sh"
+
+INDEX="$WATCH_ARCHIVE_DIR/index.jsonl"
+
+usage() {
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[watch-archive] error: python3 not found on PATH tag=missing-dep:python3" >&2
+  exit 2
+fi
+
+cmd_ls() {
+  local limit="${1:-20}"
+  if [[ ! -s "$INDEX" ]]; then
+    echo "(archive is empty — $WATCH_ARCHIVE_DIR)"
+    return 0
+  fi
+  python3 - "$INDEX" "$limit" <<'PY'
+import json, os, sys
+
+rows = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rows.append(json.loads(line))
+    except json.JSONDecodeError:
+        continue
+
+# The index is append-only, so re-watching a source leaves several lines for
+# the same id. Last one wins. Entries whose record directory has since been
+# deleted are dropped, so hand-pruning the archive needs no index surgery.
+latest = {}
+for r in rows:
+    if not os.path.isdir(r.get("dir") or ""):
+        continue
+    latest[r.get("id")] = r
+
+ordered = sorted(latest.values(), key=lambda r: r.get("watched_at") or "", reverse=True)
+for r in ordered[: int(sys.argv[2])]:
+    d = int(r.get("duration") or 0)
+    seg = r.get("segments") or 0
+    label = r.get("title") or r.get("source") or ""
+    print(f"{r.get('id','')}  {d//60:>3}m{d%60:02d}  {seg:>4} seg  "
+          f"{(r.get('watched_at') or '')[:10]}  {label[:64]}")
+PY
+}
+
+cmd_find() {
+  local query="${1:-}"
+  if [[ -z "$query" ]]; then
+    echo "usage: watch-archive find <query> tag=usage-error" >&2
+    exit 64
+  fi
+  python3 - "$WATCH_ARCHIVE_DIR" "$query" <<'PY'
+import glob, json, os, sys
+
+root, needle = sys.argv[1], sys.argv[2].lower()
+metas = sorted(glob.glob(os.path.join(root, "*", "meta.json")))
+hits = 0
+
+for path in metas:
+    try:
+        m = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        continue
+    label = m.get("title") or m.get("source") or ""
+    tr = m.get("transcript") or {}
+    segments = tr.get("segments") or []
+    if segments:
+        for s in segments:
+            if needle in s["text"].lower():
+                t = int(s["start"])
+                print(f"{m.get('id','')}  [{t//60:02d}:{t%60:02d}]  "
+                      f"{label[:36]}  {s['text'].strip()}")
+                hits += 1
+    elif needle in (tr.get("text") or "").lower():
+        # Backend gave no timing. Still findable, just not seekable.
+        print(f"{m.get('id','')}  [--:--]  {label[:36]}  "
+              f"(match in transcript.txt; no segment timing)")
+        hits += 1
+
+if hits == 0:
+    print(f"no match for {sys.argv[2]!r} across {len(metas)} record(s)")
+PY
+}
+
+cmd_get() {
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    echo "usage: watch-archive get <id|url> tag=usage-error" >&2
+    exit 64
+  fi
+  # Accept either the short id or the original source URL.
+  local rec="$WATCH_ARCHIVE_DIR/$key"
+  if [[ ! -d "$rec" ]]; then
+    rec="$(watch_archive_dir_for "$key")"
+  fi
+  if [[ ! -s "$rec/meta.json" ]]; then
+    echo "[watch-archive] error: not in archive: $key" >&2
+    exit 1
+  fi
+  python3 - "$rec/meta.json" <<'PY'
+import json, sys
+
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+tr = m.get("transcript") or {}
+
+
+def ts(sec):
+    sec = int(float(sec))
+    return f"{sec//60:02d}:{sec%60:02d}"
+
+
+print(f"ID: {m.get('id','')}")
+print(f"SOURCE: {m.get('source','')}")
+if m.get("title"):
+    print(f"TITLE: {m['title']}")
+if m.get("uploader"):
+    print(f"UPLOADER: {m['uploader']}")
+print(f"DURATION: {int(m.get('duration') or 0)}")
+print(f"WATCHED: {m.get('watched_at','')}")
+print(f"RECORD: {m.get('dir','')}")
+print("FRAMES:")
+for f in m.get("frames") or []:
+    print(f"  [{ts(f.get('t', 0))}] {f.get('path','')}")
+print("TRANSCRIPT:")
+segments = tr.get("segments") or []
+if segments:
+    for s in segments:
+        print(f"  [{ts(s['start'])}] {s['text']}")
+elif tr.get("text"):
+    print("  (no segment timing from the backend that produced this record)")
+    for line in tr["text"].splitlines():
+        print(f"  {line}")
+else:
+    print("  (none)")
+PY
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage; [[ -z "${1:-}" ]] && exit 64 || exit 0 ;;
+  -V|--version) echo "$WATCH_CLI_VERSION_STRING" ;;
+  ls)           shift; cmd_ls "$@" ;;
+  find)         shift; cmd_find "$@" ;;
+  get)          shift; cmd_get "$@" ;;
+  where)        echo "$WATCH_ARCHIVE_DIR" ;;
+  *)
+    echo "[watch-archive] error: unknown command '$1' tag=usage-error" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

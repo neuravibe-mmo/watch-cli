@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# transcribe <audio-or-video> [language]
+# transcribe <audio-or-video> [language] [--segments-out <path>]
 # Speech-to-text on any media file. Prints the transcript to stdout.
 # Auto-extracts audio from video and downsamples to mono 16kHz mp3 first.
+#
+# --segments-out <path> additionally writes {"text":…,"segments":[{"start",
+# "end","text"}, …]} to <path>. stdout is untouched by the flag — it stays
+# the plain transcript either way, so this script's own contract holds.
+# A backend that cannot produce timing writes segments:[] rather than
+# switching to a backend that can: WATCH_AUDIO_MODE is a contract, and
+# degrading the output format is not the same as changing the route.
 #
 # Routing (resolved at startup, single decision):
 #
@@ -45,16 +52,25 @@ source "$ROOT_DIR/lib/audio-routing.sh"
 
 INPUT=""
 LANG=""
+SEGMENTS_OUT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
-      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     -V|--version)
       echo "$WATCH_CLI_VERSION_STRING"
       exit 0
+      ;;
+    --segments-out)
+      SEGMENTS_OUT="${2:-}"
+      shift 2
+      ;;
+    --segments-out=*)
+      SEGMENTS_OUT="${1#*=}"
+      shift
       ;;
     *)
       if [[ -z "$INPUT" ]]; then
@@ -66,6 +82,57 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$SEGMENTS_OUT" ]]; then
+  RESPONSE_FORMAT="verbose_json"
+else
+  RESPONSE_FORMAT="text"
+fi
+
+# Writes the sidecar from a provider's verbose_json body. Falls back to a
+# text-only record if the body isn't the shape we expect, so an API that
+# quietly ignores verbose_json degrades to segments:[] instead of failing
+# the run. Args: <body-file> <out-path>. Echoes the plain transcript.
+_write_segments() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+try:
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("not an object")
+except Exception:
+    # Provider ignored verbose_json and sent bare text. Keep the words.
+    json.dump({"text": raw, "segments": []}, open(sys.argv[2], "w", encoding="utf-8"),
+              ensure_ascii=False)
+    print(raw)
+    sys.exit(0)
+
+segments = []
+for s in data.get("segments") or []:
+    text = (s.get("text") or "").strip()
+    if not text:
+        continue
+    segments.append({
+        "start": round(float(s.get("start", 0)), 3),
+        "end": round(float(s.get("end", 0)), 3),
+        "text": text,
+    })
+
+# Emit the provider's text verbatim. Stripping here would make stdout differ
+# by a leading space depending on whether --segments-out was passed, and this
+# flag promises to leave stdout alone.
+text = data.get("text")
+if text is None:
+    text = " ".join(s["text"] for s in segments)
+out = {"text": text, "segments": segments}
+if data.get("language"):
+    out["language"] = data["language"]
+json.dump(out, open(sys.argv[2], "w", encoding="utf-8"), ensure_ascii=False)
+print(text)
+PY
+}
 
 if [[ -z "$INPUT" ]]; then
   echo "usage: transcribe <audio-or-video> [language] tag=usage-error" >&2
@@ -151,9 +218,21 @@ case "$WATCH_AUDIO_RESOLVED_MODE" in
     else
       WHISPER_STDERR="/dev/null"
     fi
+    # Ask for the JSON sidecar only when segments were requested AND this
+    # build advertises the flag. Probing --help costs milliseconds and avoids
+    # killing an otherwise-working local run on an older whisper.cpp.
+    WHISPER_EXTRA=()
+    WHISPER_JSON=""
+    if [[ -n "$SEGMENTS_OUT" ]] && \
+       "$WATCH_WHISPER_BIN" --help 2>&1 | grep -q -- '--output-json'; then
+      WHISPER_EXTRA=(--output-json)
+      WHISPER_JSON="${STEM}.json"
+      rm -f "$WHISPER_JSON"
+    fi
     if ! "$WATCH_WHISPER_BIN" -m "$WATCH_WHISPER_MODEL" -f "$AUDIO" \
-        --output-txt -of "$STEM" >"$WHISPER_STDERR" 2>&1; then
-      rm -f "$TXT"
+        --output-txt "${WHISPER_EXTRA[@]+"${WHISPER_EXTRA[@]}"}" -of "$STEM" \
+        >"$WHISPER_STDERR" 2>&1; then
+      rm -f "$TXT" "${WHISPER_JSON:-/dev/null}"
       echo "[transcribe] error: whisper.cpp returned non-zero tag=transcribe-other" >&2
       exit 4
     fi
@@ -170,15 +249,52 @@ case "$WATCH_AUDIO_RESOLVED_MODE" in
       echo "[transcribe] error: whisper.cpp returned empty transcript tag=transcribe-silent-audio" >&2
       exit 4
     fi
+    if [[ -n "$SEGMENTS_OUT" ]]; then
+      # whisper.cpp uses its own shape: transcription[].offsets.{from,to} in
+      # milliseconds. Anything unexpected degrades to segments:[] — the text
+      # is already in hand, so a parse miss must not fail the run.
+      TEXT_FILE="$(mktemp)"
+      printf '%s' "$TEXT" > "$TEXT_FILE"
+      WHISPER_JSON="${WHISPER_JSON:-}" python3 - "$SEGMENTS_OUT" "$TEXT_FILE" <<'PY'
+import json, os, sys
+
+path = os.environ.get("WHISPER_JSON") or ""
+text = open(sys.argv[2], encoding="utf-8", errors="replace").read().strip()
+segments = []
+if path and os.path.exists(path):
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+        for s in data.get("transcription") or []:
+            body = (s.get("text") or "").strip()
+            off = s.get("offsets") or {}
+            if not body or "from" not in off:
+                continue
+            segments.append({
+                "start": round(float(off["from"]) / 1000.0, 3),
+                "end": round(float(off.get("to", off["from"])) / 1000.0, 3),
+                "text": body,
+            })
+    except Exception:
+        segments = []
+json.dump({"text": text, "segments": segments},
+          open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False)
+PY
+      rm -f "$TEXT_FILE"
+      [[ -n "$WHISPER_JSON" ]] && rm -f "$WHISPER_JSON"
+    fi
     echo "$TEXT"
     ;;
   kyma)
     # Use the "transcribe" alias rather than a concrete SKU. Lets Kyma swap
     # the underlying model (Whisper v4, Voxtral, …) without breaking watch-cli.
+    # ;type=audio/mpeg is required, not cosmetic: without it curl labels the
+    # part application/octet-stream and the endpoint rejects the upload with
+    # HTTP 415 "Unsupported audio type". That made this path — the
+    # recommended default — fail for every user in 0.3.1.
     ARGS=(
-      -F "file=@$AUDIO"
+      -F "file=@$AUDIO;type=audio/mpeg"
       -F "model=transcribe"
-      -F "response_format=text"
+      -F "response_format=$RESPONSE_FORMAT"
     )
     [[ -n "$LANG" ]] && ARGS+=(-F "language=$LANG")
     HTTP_CODE_FILE="$(mktemp)"
@@ -199,7 +315,16 @@ case "$WATCH_AUDIO_RESOLVED_MODE" in
     HTTP_CODE="${BODY: -3}"
     TEXT="${BODY:0:${#BODY}-3}"
     case "$HTTP_CODE" in
-      200) echo "$TEXT" ;;
+      200)
+        if [[ -n "$SEGMENTS_OUT" ]]; then
+          BODY_FILE="$(mktemp)"
+          printf '%s' "$TEXT" > "$BODY_FILE"
+          _write_segments "$BODY_FILE" "$SEGMENTS_OUT"
+          rm -f "$BODY_FILE"
+        else
+          echo "$TEXT"
+        fi
+        ;;
       402|429)
         echo "[transcribe] error: Kyma quota or rate limit (HTTP $HTTP_CODE) tag=transcribe-quota" >&2
         exit 4 ;;
@@ -212,10 +337,12 @@ case "$WATCH_AUDIO_RESOLVED_MODE" in
     esac
     ;;
   byok)
+    # See the kyma branch: the explicit MIME type keeps strict endpoints from
+    # rejecting the part as application/octet-stream.
     ARGS=(
-      -F "file=@$AUDIO"
+      -F "file=@$AUDIO;type=audio/mpeg"
       -F "model=whisper-large-v3-turbo"
-      -F "response_format=text"
+      -F "response_format=$RESPONSE_FORMAT"
     )
     [[ -n "$LANG" ]] && ARGS+=(-F "language=$LANG")
     BODY="$(curl -sS -X POST \
@@ -232,7 +359,16 @@ case "$WATCH_AUDIO_RESOLVED_MODE" in
     HTTP_CODE="${BODY: -3}"
     TEXT="${BODY:0:${#BODY}-3}"
     case "$HTTP_CODE" in
-      200) echo "$TEXT" ;;
+      200)
+        if [[ -n "$SEGMENTS_OUT" ]]; then
+          BODY_FILE="$(mktemp)"
+          printf '%s' "$TEXT" > "$BODY_FILE"
+          _write_segments "$BODY_FILE" "$SEGMENTS_OUT"
+          rm -f "$BODY_FILE"
+        else
+          echo "$TEXT"
+        fi
+        ;;
       402|429)
         echo "[transcribe] error: BYOK quota or rate limit (HTTP $HTTP_CODE) tag=transcribe-quota" >&2
         exit 4 ;;

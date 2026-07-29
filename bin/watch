@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # watch <url> [frame-count] [--cookies <file>] [--format text|json] [--pipe]
+#             [--no-cache]
 # One-shot orchestrator: download a video, extract evenly-spaced frames,
 # transcribe the audio. Prints a single structured block easy for an AI
 # agent to consume.
+#
+# Every successful run is archived (see lib/archive.sh and docs/archive.md),
+# so watching the same source again reuses the stored transcript instead of
+# paying for ASR twice. --no-cache forces a fresh run. The output block is
+# byte-identical whether it came from cache or from the network — the cache
+# is a cost optimization, not a different mode. Query the archive with
+# `watch-archive ls|find|get`.
 #
 # Text format (default) — see docs/output-schema.md:
 #   WATCH_OUTPUT_VERSION: 1
@@ -53,12 +61,15 @@ ROOT_DIR="$(cd "$SELF_DIR/.." && pwd)"
 source "$ROOT_DIR/lib/version.sh"
 # shellcheck source=../lib/health.sh
 source "$ROOT_DIR/lib/health.sh"
+# shellcheck source=../lib/archive.sh
+source "$ROOT_DIR/lib/archive.sh"
 
 URL=""
 COUNT="8"
 COOKIES_ARG=""
 FORMAT="text"
 PIPE=0
+NO_CACHE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,8 +93,12 @@ while [[ $# -gt 0 ]]; do
       PIPE=1
       shift
       ;;
+    --no-cache)
+      NO_CACHE=1
+      shift
+      ;;
     -h|--help)
-      sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     -V|--version)
@@ -108,7 +123,7 @@ if [[ $PIPE -eq 1 ]]; then
 fi
 
 if [[ $PIPE -eq 0 && -z "$URL" ]]; then
-  echo "usage: watch <url> [frame-count] [--cookies <file>] [--format text|json] [--pipe] tag=usage-error" >&2
+  echo "usage: watch <url> [frame-count] [--cookies <file>] [--format text|json] [--pipe] [--no-cache] tag=usage-error" >&2
   exit 64
 fi
 
@@ -143,41 +158,114 @@ process_url() {
   # 30s download surfaces a hint up front.
   check_platform_for_url "$url" || true
 
-  echo "[watch] downloading $url …" >&2
-  local video dl_rc
-  # shellcheck disable=SC2086
-  video="$("$SELF_DIR/dl-video" "$url" $cookies_arg)"
-  dl_rc=$?
-  if [[ $dl_rc -ne 0 ]]; then
-    if [[ "$pipe_mode" -eq 1 ]]; then
-      _emit_pipe_error "$url" "$dl_rc" "download-failed"
+  local video dur dur_int frames transcript
+  local dl_rc ef_rc tr_rc=0
+  local from_cache=0
+
+  # ── Archive lookup ──
+  # A record only counts when its transcript is non-empty (see
+  # lib/archive.sh), so a previously failed transcribe never masks a retry.
+  # Frames are archived alongside the record and therefore outlive /tmp; the
+  # mp4 is not, so if it has been cleared we still re-download — VIDEO: must
+  # name a file that exists — but the ASR call is skipped either way.
+  if [[ $NO_CACHE -eq 0 ]] && watch_archive_has "$url"; then
+    video="$(watch_archive_field "$url" video_path)"
+    dur_int="$(watch_archive_field "$url" duration)"
+    frames="$(watch_archive_field "$url" frame_paths)"
+    transcript="$(watch_archive_field "$url" transcript)"
+
+    # The stored frame count is whatever the run that filled this record
+    # asked for. docs/output-schema.md promises the caller gets the count
+    # they requested, so a mismatch means recutting — cheap, local ffmpeg —
+    # while still skipping the ASR call, which is the part worth caching.
+    local cached_frames rec_frames
+    cached_frames="$(grep -c . <<< "$frames")"
+    rec_frames="$(watch_archive_dir_for "$url")/frames"
+
+    if [[ -z "$video" || ! -f "$video" ]]; then
+      echo "[watch] cache hit, but the video is gone — re-downloading …" >&2
+      # shellcheck disable=SC2086
+      video="$("$SELF_DIR/dl-video" "$url" $cookies_arg)"
+      dl_rc=$?
+      if [[ $dl_rc -ne 0 ]]; then
+        [[ "$pipe_mode" -eq 1 ]] && _emit_pipe_error "$url" "$dl_rc" "download-failed"
+        return $dl_rc
+      fi
+    fi
+
+    if [[ "$cached_frames" != "$count" ]]; then
+      echo "[watch] cache hit; recutting $count frames (record has $cached_frames) …" >&2
+      rm -rf "$rec_frames"
+      mkdir -p "$rec_frames"
+      frames="$("$SELF_DIR/extract-frames" "$video" "$count" "$rec_frames")"
+      ef_rc=$?
+      if [[ $ef_rc -ne 0 ]]; then
+        echo "[watch] error: extract-frames failed (rc=$ef_rc)" >&2
+        [[ "$pipe_mode" -eq 1 ]] && _emit_pipe_error "$url" 1 "extract-frames-failed"
+        return 1
+      fi
+      watch_archive_set_frames "$url" "$rec_frames/frames.json" \
+        || echo "[watch] warning: could not update archived frames" >&2
+    else
+      echo "[watch] cache hit — skipping download and transcription" >&2
+    fi
+    from_cache=1
+  fi
+
+  if [[ $from_cache -eq 0 ]]; then
+    echo "[watch] downloading $url …" >&2
+    # shellcheck disable=SC2086
+    video="$("$SELF_DIR/dl-video" "$url" $cookies_arg)"
+    dl_rc=$?
+    if [[ $dl_rc -ne 0 ]]; then
+      if [[ "$pipe_mode" -eq 1 ]]; then
+        _emit_pipe_error "$url" "$dl_rc" "download-failed"
+        return $dl_rc
+      fi
       return $dl_rc
     fi
-    return $dl_rc
-  fi
-  echo "[watch] video: $video" >&2
+    echo "[watch] video: $video" >&2
 
-  local dur dur_int
-  dur="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video" 2>/dev/null || echo 0)"
-  dur_int="${dur%.*}"
-  [[ -z "$dur_int" ]] && dur_int=0
+    dur="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video" 2>/dev/null || echo 0)"
+    dur_int="${dur%.*}"
+    [[ -z "$dur_int" ]] && dur_int=0
 
-  echo "[watch] extracting $count frames …" >&2
-  local frames ef_rc
-  frames="$("$SELF_DIR/extract-frames" "$video" "$count")"
-  ef_rc=$?
-  if [[ $ef_rc -ne 0 ]]; then
-    echo "[watch] error: extract-frames failed (rc=$ef_rc)" >&2
-    if [[ "$pipe_mode" -eq 1 ]]; then
-      _emit_pipe_error "$url" 1 "extract-frames-failed"
+    echo "[watch] extracting $count frames …" >&2
+    # Cut frames straight into the archive record rather than /tmp, then copy.
+    # One location means a cache hit emits the same paths a cold run did, and
+    # the frames outlive /tmp being cleared. docs/output-schema.md classes the
+    # frame directory as implementation detail, so moving it is contract-safe.
+    local rec_frames
+    rec_frames="$(watch_archive_dir_for "$url")/frames"
+    mkdir -p "$rec_frames"
+    frames="$("$SELF_DIR/extract-frames" "$video" "$count" "$rec_frames")"
+    ef_rc=$?
+    if [[ $ef_rc -ne 0 ]]; then
+      echo "[watch] error: extract-frames failed (rc=$ef_rc)" >&2
+      if [[ "$pipe_mode" -eq 1 ]]; then
+        _emit_pipe_error "$url" 1 "extract-frames-failed"
+      fi
+      return 1
     fi
-    return 1
-  fi
 
-  echo "[watch] transcribing audio …" >&2
-  local transcript tr_rc
-  transcript="$("$SELF_DIR/transcribe" "$video")"
-  tr_rc=$?
+    echo "[watch] transcribing audio …" >&2
+    local seg_file
+    seg_file="$(mktemp)"
+    transcript="$("$SELF_DIR/transcribe" "$video" --segments-out "$seg_file")"
+    tr_rc=$?
+
+    # Store only on success. An empty transcript is not an answer worth
+    # remembering — the next run should get a real attempt, not this one.
+    if [[ $tr_rc -eq 0 && -n "$transcript" ]]; then
+      local info_json
+      info_json="${video%.mp4}.info.json"
+      [[ -f "$info_json" ]] || info_json=""
+      watch_archive_put "$url" "$video" "$dur_int" \
+        "$rec_frames/frames.json" "$seg_file" "$info_json" \
+        || echo "[watch] warning: could not write archive record" >&2
+    fi
+    rm -f "$seg_file"
+  fi
 
   local exit_code=0
   if [[ $tr_rc -ne 0 ]]; then

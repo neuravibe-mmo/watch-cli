@@ -1,5 +1,11 @@
 # Output schema (v1)
 
+> **Unchanged in 0.3.2.** That release added a transcript archive and
+> frame/segment timestamps, but every one of those lives in a record on
+> disk or behind an opt-in flag. The block below did not move: a cache
+> hit and a cold run emit byte-identical output, and no consumer written
+> against v1 needs an edit. See [`archive.md`](archive.md).
+
 watch-cli emits a single, structured payload on stdout. That payload is
 a contract. Agents, MCP servers, shell wrappers, and CI scripts read it
 and branch on its fields. Once a consumer has been written against this

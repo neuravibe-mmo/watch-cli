@@ -7,6 +7,14 @@
 # wasting tokens on near-duplicates and still tells the visual story of a
 # typical 30s–3min clip.
 #
+# stdout is unchanged and remains the contract: one bare absolute path per
+# line. The second each frame was cut at is written to <out-dir>/frames.json
+# as [{"index","t","path"}, …]. The timestamps are computed anyway to seek
+# ffmpeg; keeping them is free, and it's what lets a caller say "at 04:32"
+# instead of "somewhere in the video". Per docs/output-schema.md the names of
+# files inside the frame directory are implementation detail, so a sibling
+# file here is not a contract change.
+#
 # Exit codes (see docs/exit-codes.md):
 #   0 success · 1 general · 2 missing-dep · 64 usage error
 
@@ -101,6 +109,9 @@ for i in range(1, n + 1):
     print(f"{t:.3f}")
 PY
 
+MANIFEST_TSV="$OUTDIR/.manifest"
+: > "$MANIFEST_TSV"
+
 i=1
 emitted=0
 while IFS= read -r ts; do
@@ -108,13 +119,29 @@ while IFS= read -r ts; do
   if ffmpeg -hide_banner -loglevel error -y -ss "$ts" -i "$VIDEO" -frames:v 1 -q:v 4 "$out" >&2 2>&1; then
     if [[ -s "$out" ]]; then
       echo "$out"
+      printf '%s\t%s\t%s\n' "$i" "$ts" "$out" >> "$MANIFEST_TSV"
       emitted=$((emitted + 1))
     fi
   fi
   i=$((i + 1))
 done < "$OUTDIR/.timestamps"
 
-rm -f "$OUTDIR/.timestamps"
+# Only frames that actually landed on disk get a manifest entry, so
+# frames.json and stdout always list the same set.
+python3 - "$MANIFEST_TSV" > "$OUTDIR/frames.json" <<'PY'
+import json, sys
+frames = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        idx, t, path = line.split("\t", 2)
+        frames.append({"index": int(idx), "t": round(float(t), 3), "path": path})
+print(json.dumps(frames, ensure_ascii=False, indent=2))
+PY
+
+rm -f "$OUTDIR/.timestamps" "$MANIFEST_TSV"
 
 if (( emitted == 0 )); then
   echo "[extract-frames] error: no frames extracted from $VIDEO" >&2

@@ -86,12 +86,17 @@ fi
 # muxed file. /best fallback covers everything else.
 FORMAT='best[height<=720]/best'
 
+# --write-info-json drops a <hash>.info.json sidecar (title, uploader,
+# duration) next to the mp4. It rides along with the download already in
+# flight, so naming an archived video later costs no extra request. stdout
+# is unchanged: still just the mp4 path.
 run_dl() {
   yt-dlp \
     --no-playlist \
     --no-warnings \
     --no-progress \
     --merge-output-format mp4 \
+    --write-info-json \
     -f "$FORMAT" \
     -o "$OUT" \
     "$@" \
