@@ -26,7 +26,7 @@
 #
 # JSON format (--format json) — single line:
 #   {"version":1,"video_path":"…","duration_sec":…,"frame_paths":[…],
-#    "transcript":"…"|null,"exit_code":…,"transcribe_cost_usd":…}
+#    "transcript":"…"|null,"exit_code":…}
 #
 # Pipe mode (--pipe): reads URLs from stdin (one per line), emits one
 # compact JSON object per URL to stdout (JSONL). Implies --format json

@@ -104,7 +104,7 @@ fields.
 | `frame_paths` | array of string | yes | Absolute paths to extracted JPG frames. Ordered earliest-in-video first. Length matches the requested frame count. |
 | `transcript` | string or null | yes | Full transcript text, or `null` if the transcribe step failed (in which case `exit_code` will be `4`). The field is always present — its value, not its presence, signals failure. |
 | `exit_code` | integer | yes | Final exit code from `bin/watch`. Mirrors the text-format `EXIT:` line and the process exit. See [`exit-codes.md`](exit-codes.md). |
-| `transcribe_cost_usd` | number | no | Per-call transcribe cost in US dollars, when the backend reports it. Absent (key not present) when unknown — for example, when running with a BYOK key against a provider that does not return cost metadata. |
+| `transcribe_cost_usd` | number | no | **Reserved — not emitted by any shipping version.** Intended to carry the per-call transcribe cost in US dollars when the backend reports it. No backend currently returns cost metadata to the CLI, so the key is always absent today. It is kept in this table because the name is reserved: if cost reporting lands, it lands under this name with this type, inside v1. Do not write code that waits for it. |
 
 ### Required vs optional
 
@@ -113,11 +113,15 @@ output, regardless of success or failure. "Optional" means the key may
 be absent. Consumers should treat absence as "value unknown", not as
 zero or empty.
 
-A consumer that wants the cost field should check key presence
-explicitly (`if "transcribe_cost_usd" in obj` in Python, `.transcribe_cost_usd
-// empty` in `jq`) rather than defaulting absent values to `0`. A `0`
-cost is meaningful (cached transcript, free tier); an absent cost is
-"the backend did not tell us".
+Absence means "value unknown", never zero. If an optional field ever
+carries a number where `0` is itself meaningful — a free-tier call, say —
+then defaulting an absent key to `0` silently invents a fact. Check key
+presence explicitly (`if key in obj` in Python, `.key // empty` in `jq`).
+
+This rule is written against a field that does not exist yet:
+`transcribe_cost_usd` is reserved and no shipping version emits it. Treat
+the guidance as the pattern for optional fields generally, not as a hint
+that cost data is available.
 
 ---
 
@@ -220,10 +224,14 @@ actual output is one line):
     "/tmp/frames_abc123/frame_08.jpg"
   ],
   "transcript": "Today I want to talk about how decomposition unlocks ten times cost reduction in multimodal pipelines. The core idea is that a video is just frames plus audio, and each of those already has a fast, near-free primitive that has existed for years.",
-  "exit_code": 0,
-  "transcribe_cost_usd": 0.00018
+  "exit_code": 0
 }
 ```
+
+Six keys, and those six are what every shipping version emits. The
+reserved `transcribe_cost_usd` is deliberately not shown here — an example
+is the first thing people copy, and showing a key that never appears would
+send them looking for it.
 
 To extract a single field:
 

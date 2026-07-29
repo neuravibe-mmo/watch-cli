@@ -45,7 +45,7 @@ parser around its stderr. Documented exit codes are the first step:
 | `2` | missing dependency | A required binary (`yt-dlp`, `ffmpeg`, `ffprobe`, `jq`, `curl`, `python3`) is not on `PATH`. | `[watch] error: ffmpeg not found on PATH. Install via 'brew install ffmpeg' or 'apt install ffmpeg'.` | Install the missing tool, then retry. Do not auto-retry. |
 | `3` | download failed | `yt-dlp` returned a non-zero exit. The pipeline cannot continue without a video file. The stderr line includes a `tag=…` token so callers can grep without needing extra exit codes (see below). | `[watch] error: download failed for <url> tag=download-auth — sign in to the platform in your browser and re-run, or pass --cookies <file>` | Inspect the `tag=…` value. Auth → retry with cookies. Region → try VPN. Network → wait and retry. Other → file an issue. |
 | `4` | transcribe failed | Frame extraction succeeded but the transcribe step failed. Output is partial: `frame_paths` is populated, `transcript` is `null`. See *Partial success* below. The stderr line includes a `tag=…` token. | `[watch] error: transcribe failed tag=transcribe-quota — top up Kyma credit at https://kymaapi.com/billing or set GROQ_API_KEY for BYOK` | Read the partial output and decide. Quota → top up. Timeout → retry with shorter audio. Silent-audio → expected, fall through to frames only. |
-| `64` | usage error | Bad invocation: missing required argument, unknown flag, malformed URL, or `-h` / `--help` was passed in a context where the caller wants a non-zero. Mirrors `sysexits.h` `EX_USAGE`. | `usage: watch <url> [frame-count] [--cookies <file>]` | Do not retry. Fix the invocation. |
+| `64` | usage error | Bad invocation: missing required argument, unknown flag, malformed URL, or `-h` / `--help` was passed in a context where the caller wants a non-zero. Mirrors `sysexits.h` `EX_USAGE`. | `usage: watch <url> [frame-count] [--cookies <file>] [--format text\|json] [--pipe] [--no-cache] tag=usage-error` | Do not retry. Fix the invocation. |
 
 ### Stderr tag tokens
 
@@ -72,6 +72,36 @@ allowed).
 | `transcribe-timeout` | The transcribe backend did not return within the script's timeout. The audio file is probably too long, or the backend is slow. Retry with split audio or wait. |
 | `transcribe-silent-audio` | The audio decoded successfully but the backend returned an empty transcript. Common for music videos, screen-recordings of code without narration, and very short clips. Not a true failure — caller should fall through to frames-only consumption. |
 | `transcribe-other` | Anything else: backend 5xx, malformed response, audio file rejected as too large after downsample, unknown error. Surface raw stderr. |
+
+**`exit 2` (missing dependency or missing key) tags:**
+
+| Tag | Meaning |
+|---|---|
+| `missing-dep:<binary>` | A required binary is not on `PATH`. The suffix names it: `missing-dep:yt-dlp`, `missing-dep:ffmpeg`, `missing-dep:curl`, `missing-dep:python3`, `missing-dep:whisper-cli`. Install it and retry; never auto-retry. |
+| `missing-key:<VAR>` | An explicitly requested `WATCH_AUDIO_MODE` has no credential for its route — `missing-key:KYMA_API_KEY`, `missing-key:GROQ_API_KEY`. The script does not silently fall back to a different backend; see [`offline-mode.md`](offline-mode.md). |
+| `missing-config` | Local mode was requested but its model file or configuration is not in place. Run `install.sh --with-local`. |
+
+**`exit 64` (usage) tags:**
+
+| Tag | Meaning |
+|---|---|
+| `usage-error` | Bad invocation: missing argument, unknown flag, unreadable input file, malformed URL in `--pipe` input. Fix the call; retrying identical input cannot help. |
+
+**Other tags:**
+
+| Tag | Where | Meaning |
+|---|---|---|
+| `audio-q-requires-api` | `audio-q` | Audio understanding has no local backend. Unlike `transcribe`, it cannot run offline and needs an API route. |
+| `platform-probe-fail` | `watch` | **Warning, not a failure.** The pre-flight probe found yt-dlp's extractor for this domain looks broken today. The run continues; the exit code is unaffected. Surfaces early so a doomed download is not blamed on the schema. Run `yt-dlp -U` if the download does fail. |
+| `insufficient-disk` | `install.sh` | Less than the required free space for the local model download. |
+| `model-checksum-mismatch` | `install.sh` | The downloaded model file failed its SHA256 check. Treated as a hard failure rather than a warning, because a corrupt model produces plausible-looking wrong transcripts. |
+| `tarball-checksum-mismatch` | `install.sh` | The release tarball failed its SHA256 check. Hard failure — the install stops rather than unpacking unverified bytes. |
+
+Two of these ride on a process that is not exiting non-zero:
+`platform-probe-fail` is a warning printed mid-run, and the `install.sh`
+tags belong to the installer rather than to any `bin/` command. They are
+listed here because they use the same `tag=` convention, and a consumer
+grepping stderr for `tag=` will encounter them.
 
 ---
 

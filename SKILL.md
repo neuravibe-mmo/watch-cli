@@ -65,6 +65,22 @@ watch <url> [frame-count]
 
 Default frame count is 8. For a fast-cut or dense UI demo, double it. For a multi-hour conference talk, bump to 24–32. The CLI does not cap; agent hosts typically prefer ≤ 32.
 
+## Check the archive before watching
+
+Every successful run is stored under `~/.watch-cli/archive`. Re-watching a URL is a cache hit — no download, no transcription, and the output block is byte-identical to the cold run — so re-running a URL is cheap, but re-*deriving* an answer already on disk is wasted work.
+
+```bash
+watch-archive find "context graph"   # → id, [04:32], the matching line
+watch-archive ls                     # what has already been watched
+watch-archive get <id|url>           # reprint one record, transcript timestamped
+```
+
+Reach for `watch-archive find` first when the question is "have I already seen something about X?" or "where in that video did they say Y?". It searches every stored transcript and answers with a timestamp, which is a seek position rather than a video to sit through again.
+
+Records are plain JSON, SRT and JPG on disk — `grep` and `jq` read them without this CLI, and `<id>/transcript.srt` loads in any video player. Layout in [`docs/archive.md`](https://github.com/sonpiaz/watch-cli/blob/main/docs/archive.md).
+
+Pass `--no-cache` only when the source itself has changed. A failed transcription is never stored, so a retry after an error always makes a real attempt.
+
 ## Anti-patterns
 
 - Do not parse stderr. Progress lines on stderr (`[watch] downloading …`) are not part of the contract and change between releases. Programmatic consumers ignore stderr.

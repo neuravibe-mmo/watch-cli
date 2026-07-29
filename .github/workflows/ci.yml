@@ -7,6 +7,39 @@ on:
     branches: [main]
 
 jobs:
+  # docs/releases.md specifies this guardrail: lib/version.sh is the single
+  # source of truth for the version, and a main build must not disagree with
+  # the latest v* tag. Without it, main can drift to a version that was never
+  # released — which is exactly what happened before 0.3.2, when releases.md
+  # still claimed v0.2.0. Runs only on main; a PR is allowed to carry the bump
+  # that its own release tag has not been cut for yet.
+  version:
+    name: version matches latest tag
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout (full history so tags are present)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare lib/version.sh against latest v* tag
+        run: |
+          set -euo pipefail
+          # shellcheck source=lib/version.sh
+          source lib/version.sh
+          latest="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+          if [[ -z "$latest" ]]; then
+            echo "no v* tag yet — nothing to compare against"
+            exit 0
+          fi
+          if [[ "v$WATCH_CLI_VERSION" != "$latest" ]]; then
+            echo "error: lib/version.sh says $WATCH_CLI_VERSION but latest tag is $latest" >&2
+            echo "fix: bump WATCH_CLI_VERSION in lib/version.sh to ${latest#v}, or cut a new tag" >&2
+            exit 1
+          fi
+          echo "ok: lib/version.sh $WATCH_CLI_VERSION matches $latest"
+
   smoke:
     name: smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
